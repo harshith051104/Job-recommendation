@@ -1,0 +1,482 @@
+import pymongo
+import json
+import re
+from langchain_huggingface import HuggingFaceEndpoint
+import PyPDF2
+import os
+
+# Database configuration
+mongo_url = "mongodb+srv://harshith:1234aBcD123@cluster0.i9eylom.mongodb.net/"
+
+# HuggingFace API configuration
+sec_key = "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"
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = sec_key
+repo_id = "google/gemma-1.1-7b-it"
+llm = HuggingFaceEndpoint(
+    repo_id=repo_id, max_length=8000, temperature=0.7, token=sec_key)
+
+# Function to extract job details from prompt string
+
+
+def extract_job_details(prompt_string):
+    job_details = {}
+
+    # Extract Job Title
+    job_title_match = re.search(r"\*+Job Title:\*+\s*(.*?)\n", prompt_string)
+    if job_title_match:
+        job_details["Job Title"] = job_title_match.group(1).strip()
+
+    # Extract Salary Range
+    salary_range_match = re.search(
+        r"\*Salary Range:\*+\s*(.*?)\n", prompt_string)
+    if salary_range_match:
+        job_details["Salary Range"] = salary_range_match.group(1).strip()
+
+    # Extract Company
+    company_match = re.search(r"\*Company:\*+\s*(.*?)\n", prompt_string)
+    if company_match:
+        job_details["Company"] = company_match.group(1).strip()
+
+    # Extract Responsibilities
+    responsibilities_match = re.search(
+        r"\*Responsibilities:\*+\s*([\s\S]*?)\*+Qualifications:", prompt_string, re.DOTALL)
+    if responsibilities_match:
+        responsibilities = responsibilities_match.group(1).strip()
+        responsibilities_list = responsibilities.split("\n")
+        job_details["Responsibilities"] = [resp.strip("- ")
+                                           for resp in responsibilities_list if resp.strip()]
+    else:
+        job_details["Responsibilities"] = []
+
+    # Extract Qualifications
+    qualifications_match = re.search(
+        r"\*Qualifications:\*+\s*([\s\S]*?)\*+Additional Information:", prompt_string, re.DOTALL)
+    if qualifications_match:
+        qualifications = qualifications_match.group(1).strip()
+        qualifications_list = qualifications.split("\n")
+        job_details["Qualifications"] = [qual.strip("- ")
+                                         for qual in qualifications_list if qual.strip()]
+    else:
+        job_details["Qualifications"] = []
+
+    # Extract Additional Information
+    additional_info_match = re.search(
+        r"\*Additional Information:\*+\s*(.*?)\n\s*\*", prompt_string, re.DOTALL)
+    if additional_info_match:
+        job_details["Additional Information"] = additional_info_match.group(
+            1).strip()
+    else:
+        job_details["Additional Information"] = ""
+
+    # Extract Recommendations
+    recommendations_match = re.search(
+        r"\*Recommendations:\*+\s*(.*)", prompt_string, re.DOTALL)
+    if recommendations_match:
+        recommendations = recommendations_match.group(1).strip()
+        recommendations_list = recommendations.split("\n")
+        job_details["Recommendations"] = [rec.strip()
+                                          for rec in recommendations_list if rec.strip()]
+    else:
+        job_details["Recommendations"] = []
+
+    return job_details
+
+# Function to get resume text from uploaded file
+
+
+TEST_MODE = True
+
+
+def get_resume_text(resume_file):
+    if TEST_MODE:
+        resume_file = resume_file
+    if resume_file is not None and (TEST_MODE or resume_file.type == "application/pdf"):
+        # Read the PDF file
+        pdf_reader = PyPDF2.PdfReader(resume_file)
+        # Extract the content
+        content = ""
+        for page in range(len(pdf_reader.pages)):
+            content += pdf_reader.pages[page].extract_text()
+        # Display the content
+        return content
+
+    return "No resume uploaded."
+
+# Function to generate job recommendation based on student data
+
+
+def generate_job_recommendation(student_data):
+    course_name = student_data['course_name']
+    prompt = f"""
+    Role: Career advisor specializing in job recommendations for students.
+    Instruction: Explore different platforms and generate a suitable job description based on student's {course_name}, student information.
+               Consider both {course_name} and {student_data}.
+               * The Generated job description should match the student's qualifications:
+               - If a student is poor in academics, they should get a job recommendation which is slightly less popular/less paying.
+               - If a student is good in academics, they should get a job recommendation which is more popular/more paying.
+               * Only Include the information which are corresponding to the Output structure do not include any other information.
+               * Generate a suitable job description and personalized advice based on this student's information and student's Course.
+               * The job description should vary from one student to another.
+               * Strictly follow the output structure, do not include any additional output/information.
+               * Take into account the details from the student's resume.
+    Output Structure:
+        Job Recommendation Output:
+        Job Title: (required)
+        Salary Range: (required)
+        Company: (Name, Industry, Size, Culture)(required)
+        Responsibilities:Generate List of strings representing responsibilities of the person appointed for that postion[Minimum 3 responsibilities required]
+        Qualifications:generate List of strings representing qualifications to be attained by person appointed for that position[Minimum 3 qualifications required]
+        Additional Information: write a brief about the job description, company that is offering the job and trends.
+"""
+
+    # Initialize recommendations list
+    recommendations = []
+
+    # Check attendance percentage
+    if student_data['attendance_percentage'] < 80:
+        recommendations.append(
+            "Attendance Percentage Below 80%: Improve attendance to meet the minimum requirement.")
+
+    resume_text = get_resume_text(student_data['resume'])
+
+    # Check resume text
+    if not resume_text:
+        recommendations.append(
+            "Resume Not Uploaded: Upload your resume to receive job recommendations.")
+    else:
+        prompt += f"Resume Text: {resume_text}\n"
+
+    # Check module completion and related details
+    for i in range(1, 9):
+        module_completed = student_data[f'module_{i}_completed']
+        quiz_passed = student_data[f'module_{i}_quiz_passed']
+        certificate_received = student_data.get(
+            f'module_{i}_certificate_received', False)  # Use .get() to handle missing keys
+        if not module_completed:
+            recommendations.append(
+                f"Module {i} Not Completed: Complete Module {i} to receive the completion certificate.")
+        elif not quiz_passed:
+            recommendations.append(
+                f"Quiz for Module {i} Not Passed: Ensure to pass the quiz for Module {i}.")
+        elif not certificate_received:
+            recommendations.append(
+                f"Module {i} Certificate Not Received: Check and obtain the completion certificate for Module {i}.")
+
+    # Check assignment completion percentage
+    if student_data['assignment_completion_percentage'] < 80:
+        recommendations.append(
+            "Assignment Completion Percentage Below 80%: Improve assignment completion to meet the minimum requirement.")
+
+    # Check overall quiz passed
+    if not student_data['overall_quiz_passed']:
+        recommendations.append(
+            "Overall Quiz Not Passed: Ensure to pass the overall quiz with a minimum of 80%.")
+
+    # Check LinkedIn and related activities
+    if not student_data['linkedin_account_created']:
+        recommendations.append(
+            "LinkedIn Account Not Created: Create a LinkedIn account to enhance your professional network.")
+    if not student_data['module_certificates_uploaded_on_linkedin']:
+        recommendations.append(
+            "Module Certificates Not Uploaded on LinkedIn: Upload your module completion certificates on LinkedIn.")
+    if not student_data['taken_course_exam']:
+        recommendations.append(
+            "Course Exam Not Taken: Take the course exam to demonstrate your knowledge and skills.")
+    if not student_data['received_course_completion_certificate']:
+        recommendations.append(
+            "Course Completion Certificate Not Received: Check and obtain the course completion certificate.")
+    if not student_data['course_completion_certificate_updated_on_linkedin']:
+        recommendations.append(
+            "Course Completion Certificate Not Updated on LinkedIn: Update your course completion certificate on LinkedIn.")
+
+    # Check project completion and related details
+    for i in range(1, 5):
+        # Use .get() to handle missing keys
+        project_completed = student_data.get(f'project_{i}_completed', False)
+        # Use .get() to handle missing keys
+        viva_voce_passed = student_data.get(
+            f'project_{i}_viva_voce_passed', False)
+        project_certificate_received = student_data.get(
+            f'project_{i}_completion_certificate', False)  # Use .get() to handle missing keys
+        if not project_completed:
+            recommendations.append(
+                f"Project {i} Not Completed: Complete Project {i} to receive the completion certificate.")
+        elif not viva_voce_passed:
+            recommendations.append(
+                f"Viva Voce for Project {i} Not Passed: Ensure to pass the viva voce for Project {i}.")
+        elif not project_certificate_received:
+            recommendations.append(
+                f"Project {i} Certificate Not Received: Check and obtain the completion certificate for Project {i}.")
+
+    if not student_data['viva_voce_related_to_projects_passed']:
+        recommendations.append(
+            "Viva Voce Related to Projects Not Passed: Ensure to pass all viva voce related to the projects.")
+
+    # Check project completion count
+    if student_data['project_completion_count'] < 4:
+        recommendations.append(
+            "Not Completed All Projects: Complete all projects to enhance your practical skills.")
+
+    # Check project completion certificates updated on LinkedIn
+    if not student_data['project_completion_certificates_updated_on_linkedin']:
+        recommendations.append(
+            "Project Completion Certificates Not Updated on LinkedIn: Update your LinkedIn profile with project completion certificates.")
+
+    # Check NASSCOM and SUNNY exams
+    if not student_data['nasscom_exam_cleared']:
+        recommendations.append(
+            "NASSCOM Exam Not Cleared: Prepare thoroughly for the NASSCOM exam.")
+    if not student_data['nasscom_certificate_received']:
+        recommendations.append(
+            "NASSCOM Certificate Not Received: Obtain the NASSCOM certificate.")
+    if not student_data['nasscom_certificate_updated_on_linkedin']:
+        recommendations.append(
+            "NASSCOM Certificate Not Updated on LinkedIn: Update your LinkedIn profile with the NASSCOM certificate.")
+    if not student_data['sunny_exam_cleared']:
+        recommendations.append(
+            "SUNNY Exam Not Cleared: Prepare thoroughly for the SUNNY exam.")
+    if not student_data['sunny_certificate_received']:
+        recommendations.append(
+            "SUNNY Certificate Not Received: Obtain the SUNNY certificate.")
+    if not student_data['sunny_certificate_updated_on_linkedin']:
+        recommendations.append(
+            "SUNNY Certificate Not Updated on LinkedIn: Update your LinkedIn profile with the SUNNY certificate.")
+
+    # Check research paper publication
+    if not student_data['research_paper_published']:
+        recommendations.append(
+            "Research Paper Not Published: Work towards publishing a research paper.")
+
+    if not student_data['linkedin_updated']:
+        recommendations.append(
+            "LinkedIn Profile Not Updated: Keep your LinkedIn profile up to date with your latest achievements and certifications.")
+
+    # Check internship status
+    if not student_data['selected_for_internship']:
+        recommendations.append(
+            "Internship Not Secured: Apply for internships related to your field of study.")
+
+    if not student_data['internship_status_updated_on_linkedin']:
+        recommendations.append(
+            "Internship Status Not Updated on LinkedIn: Update your internship status on LinkedIn.")
+
+    # Check resume and profile creation/upload on job platforms
+    if not student_data['created_resume']:
+        recommendations.append(
+            "Resume Not Created: Create a professional resume.")
+
+        if student_data['uploaded_resume_on_linkedin']:
+            recommendations.append(
+                "Resume is not created, so it cannot be uploaded on LinkedIn.")
+
+        if student_data['uploaded_resume_on_indeed']:
+            recommendations.append(
+                "Resume is not created, so it cannot be uploaded on Indeed.")
+
+        if student_data['uploaded_resume_on_glassdoor']:
+            recommendations.append(
+                "Resume is not created, so it cannot be uploaded on Glassdoor.")
+
+        if student_data['uploaded_resume_on_ziprecruiter']:
+            recommendations.append(
+                "Resume is not created, so it cannot be uploaded on ZipRecruiter.")
+
+        if student_data['uploaded_resume_on_monster']:
+            recommendations.append(
+                "Resume is not created, so it cannot be uploaded on Monster.")
+
+        if student_data['uploaded_resume_on_simplyhired']:
+            recommendations.append(
+                "Resume is not created, so it cannot be uploaded on SimplyHired.")
+
+        # TODO: Add more such checks for resume creation/uploading
+    else:
+        if not student_data['uploaded_resume_on_linkedin']:
+            recommendations.append(
+                "Resume Not Uploaded on LinkedIn: Upload your resume on LinkedIn.")
+        if not student_data['created_profile_on_indeed']:
+            recommendations.append(
+                "Profile Not Created on Indeed: Create a profile on Indeed.")
+        if not student_data['uploaded_resume_on_indeed']:
+            recommendations.append(
+                "Resume Not Uploaded on Indeed: Upload your resume on Indeed.")
+        if not student_data['created_profile_on_glassdoor']:
+            recommendations.append(
+                "Profile Not Created on Glassdoor: Create a profile on Glassdoor.")
+        if not student_data['uploaded_resume_on_glassdoor']:
+            recommendations.append(
+                "Resume Not Uploaded on Glassdoor: Upload your resume on Glassdoor.")
+        if not student_data['created_profile_on_ziprecruiter']:
+            recommendations.append(
+                "Profile Not Created on ZipRecruiter: Create a profile on ZipRecruiter.")
+        if not student_data['uploaded_resume_on_ziprecruiter']:
+            recommendations.append(
+                "Resume Not Uploaded on ZipRecruiter: Upload your resume on ZipRecruiter.")
+        if not student_data['created_profile_on_monster']:
+            recommendations.append(
+                "Profile Not Created on Monster: Create a profile on Monster.")
+        if not student_data['uploaded_resume_on_monster']:
+            recommendations.append(
+                "Resume Not Uploaded on Monster: Upload your resume on Monster.")
+        if not student_data['created_profile_on_simplyhired']:
+            recommendations.append(
+                "Profile Not Created on SimplyHired: Create a profile on SimplyHired.")
+        if not student_data['uploaded_resume_on_simplyhired']:
+            recommendations.append(
+                "Resume Not Uploaded on SimplyHired: Upload your resume on SimplyHired.")
+
+    if not student_data['resume']:
+        recommendations.append(
+            "Resume Not Uploaded: Upload your resume to recieve job recommendations.")
+
+    # Format recommendations
+    formatted_recommendations = "\n".join(
+        [f"{index + 1}. {rec}" for index, rec in enumerate(recommendations)])
+
+    print(formatted_recommendations)
+
+    # Add recommendations to prompt
+    # prompt += f"*Recommendations:* \n{formatted_recommendations}\n"
+
+    # Generate job recommendation using LLM
+    job_recommendation = llm.invoke(prompt)
+
+    print("\n\nJob Recommendation Output from LLM")
+    print(job_recommendation)
+
+    job_recommendation += f"\n*Recommendations:* \n{formatted_recommendations}\n"
+
+    # Extract job details from recommendation
+    job_details = extract_job_details(job_recommendation)
+
+    print("\n\nExtracted Job Details")
+    print(job_details)
+
+    return job_details
+
+# Function to save job recommendation to MySQL database
+
+
+def save_job_recommendation_to_db(student_data, job_recommendation):
+    try:
+        # Connect to the database
+        client = pymongo.MongoClient(mongo_url)
+        db = client["job_recommendations"]
+        collection = db["recommendations"]
+
+        # Ensure keys exist before accessing them
+        responsibilities = json.dumps(
+            job_recommendation.get('Responsibilities', []))
+        qualifications = json.dumps(
+            job_recommendation.get('Qualifications', []))
+        additional_info = job_recommendation.get('Additional Information', '')
+        recommendations = json.dumps(
+            job_recommendation.get('Recommendations', []))
+
+        # Insert job recommendation into database
+        collection.insert_one({
+            "student_id": student_data['student_id'],
+            "job_title": job_recommendation.get('Job Title', ''),
+            "salary_range": job_recommendation.get('Salary Range', ''),
+            "company": job_recommendation.get('Company', ''),
+            "responsibilities": responsibilities,
+            "qualifications": qualifications,
+            "additional_info": additional_info,
+            "recommendations": recommendations
+        })
+
+        return True
+    except Exception as err:
+        print(f"Error: {err}")
+        return False
+
+
+student_data = {
+    "student_id": "123456",
+    "course_name": "data science",
+    "course_enrollment_type": "Online",
+    "attendance_percentage": 90,
+    "module_1_completed": True,
+    "module_1_quiz_passed": True,
+    "module_1_certificate_received": True,
+    "module_2_completed": True,
+    "module_2_quiz_passed": True,
+    "module_2_certificate_received": True,
+    "module_3_completed": True,
+    "module_3_quiz_passed": True,
+    "module_3_certificate_received": True,
+    "module_4_completed": True,
+    "module_4_quiz_passed": True,
+    "module_4_certificate_received": True,
+    "module_5_completed": True,
+    "module_5_quiz_passed": True,
+    "module_5_certificate_received": True,
+    "module_6_completed": True,
+    "module_6_quiz_passed": True,
+    "module_6_certificate_received": True,
+    "module_7_completed": True,
+    "module_7_quiz_passed": True,
+    "module_7_certificate_received": True,
+    "module_8_completed": True,
+    "module_8_quiz_passed": True,
+    "module_8_certificate_received": True,
+    "overall_quiz_passed": True,
+    "assignment_completion_percentage": 85,
+    "linkedin_account_created": True,
+    "module_certificates_uploaded_on_linkedin": True,
+    "taken_course_exam": True,
+    "course_completion_certificate_received": True,
+    "course_completion_certificate_updated_on_linkedin": True,
+    "project_1_completed": True,
+    "project_1_viva_voce_passed": True,
+    "project_1_completion_certificate": True,
+    "project_2_completed": True,
+    "project_2_viva_voce_passed": True,
+    "project_2_completion_certificate": True,
+    "project_3_completed": True,
+    "project_3_viva_voce_passed": True,
+    "project_3_completion_certificate": True,
+    "project_4_completion_certificate": True,
+    "project_4_completed": True,
+    "project_4_viva_voce_passed": True,
+    "all_projects_viva_voce_passed": True,
+    'viva_voce_related_to_projects_passed': False,
+    "received_course_completion_certificate": True,
+    "projects_completed": 4,
+    "project_completion_certificates_updated_on_linkedin": True,
+    "project_completion_count": 3,
+    "linkedin_updated": True,
+    "nasscom_exam_cleared": True,
+    "nasscom_certificate_received": True,
+    "nasscom_certificate_updated_on_linkedin": False,
+    "sunny_exam_cleared": False,
+    "sunny_certificate_received": False,
+    "sunny_certificate_updated_on_linkedin": False,
+    "research_paper_published": False,
+    "updated_on_linkedin": False,
+    "selected_for_internship": False,
+    "internship_status_updated_on_linkedin": False,
+    "resume": r"C:\Users\sriha\Documents\sample.pdf",
+    "created_resume": True,
+    "uploaded_resume_on_linkedin": True,
+    "created_profile_on_indeed": True,
+    "uploaded_resume_on_indeed": True,
+    "created_profile_on_glassdoor": True,
+    "uploaded_resume_on_glassdoor": False,
+    "created_profile_on_ziprecruiter": False,
+    "uploaded_resume_on_ziprecruiter": False,
+    "created_profile_on_monster": False,
+    "uploaded_resume_on_monster": False,
+    "created_profile_on_simplyhired": False,
+    "uploaded_resume_on_simplyhired": False
+}
+
+job_recommendation = generate_job_recommendation(student_data)
+
+save_successful = save_job_recommendation_to_db(
+    student_data, job_recommendation)
+
+if save_successful:
+    print("Job recommendation successfully saved to the database.")
+else:
+    print("Failed to save job recommendation to the database.")
